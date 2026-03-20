@@ -17,6 +17,14 @@ except ImportError:
 EXPECTED_INPUT_SHAPE = (2000, 9)
 
 
+def get_default_device_name() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class SVInferenceDataset(Dataset[tuple[Tensor, str]]):
     def __init__(self, split_directory: Path) -> None:
         if not split_directory.exists():
@@ -156,45 +164,17 @@ def run_inference(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run SVHunter inference.")
-    parser.add_argument(
-        "--checkpoint-file-path",
-        type=Path,
-        required=True,
-        help="Path to the trained model checkpoint.",
-    )
-    parser.add_argument(
-        "--split-directory",
-        type=Path,
-        required=True,
-        help="Directory containing .npy feature windows for inference.",
-    )
-    parser.add_argument(
-        "--output-file-path",
-        type=Path,
-        required=True,
-        help="Path to the output TSV file.",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=64, help="Inference batch size."
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="DataLoader worker processes.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Inference device, for example cpu or cuda.",
-    )
-    parser.add_argument(
-        "--prediction-threshold",
-        type=float,
-        default=0.5,
-        help="Threshold for converting probabilities into binary predictions.",
-    )
+
+    # fmt: off
+    parser.add_argument("--checkpoint_file_path", type=Path, required=True, help="Path to the trained model checkpoint.")
+    parser.add_argument("--split_directory", type=Path, required=True, help="Directory containing .npy feature windows for inference.")
+    parser.add_argument("--output_file_path", type=Path, required=True, help="Path to the output TSV file.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Inference batch size.")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes.")
+    parser.add_argument("--device", type=str, default=get_default_device_name(), help="Inference device, for example cpu, mps, or cuda.")
+    parser.add_argument("--prediction_threshold", type=float, default=0.5, help="Threshold for converting probabilities into binary predictions.")
+    # fmt: on
+
     return parser.parse_args()
 
 

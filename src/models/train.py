@@ -23,6 +23,14 @@ EXPECTED_INPUT_SHAPE = (2000, 9)
 EXPECTED_LABEL_LENGTH = 10
 
 
+def get_default_device_name() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -321,66 +329,22 @@ def write_json(output_file_path: Path, payload: Any) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the adapted SVHunter model.")
-    parser.add_argument(
-        "--train-dir",
-        "--train-directory",
-        dest="train_directory",
-        type=Path,
-        required=True,
-        help="Directory of training .npy files.",
-    )
-    parser.add_argument(
-        "--val-dir",
-        "--validation-dir",
-        dest="validation_directory",
-        type=Path,
-        required=True,
-        help="Directory of validation .npy files.",
-    )
-    parser.add_argument(
-        "--test-dir",
-        "--test-directory",
-        dest="test_directory",
-        type=Path,
-        required=True,
-        help="Directory of test .npy files.",
-    )
-    parser.add_argument(
-        "--labels-path",
-        "--labels-file-path",
-        dest="labels_file_path",
-        type=Path,
-        default=None,
-        help="Optional path to a shared labels.txt. If omitted, labels.txt is resolved per split.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        "--output-directory",
-        dest="output_directory",
-        type=Path,
-        required=True,
-        help="Directory for checkpoints and metrics.",
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=20, help="Number of training epochs."
-    )
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
-    parser.add_argument(
-        "--learning-rate", type=float, default=1e-4, help="Adam learning rate."
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=0.0, help="Adam weight decay."
-    )
-    parser.add_argument(
-        "--num-workers", type=int, default=0, help="DataLoader worker processes."
-    )
+
+    # fmt: off
+    parser.add_argument("--train_directory", dest="train_directory", type=Path, required=True, help="Directory of training .npy files.")
+    parser.add_argument("--validation_directory", dest="validation_directory", type=Path, required=True, help="Directory of validation .npy files.")
+    parser.add_argument("--test_directory", dest="test_directory", type=Path, required=True, help="Directory of test .npy files.")
+    parser.add_argument("--labels_file_path", dest="labels_file_path", type=Path, default=None, help="Optional path to a shared labels.txt. If omitted, labels.txt is resolved per split.")
+    parser.add_argument("--output_directory", dest="output_directory", type=Path, required=True, help="Directory for checkpoints and metrics.")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Adam learning rate.")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="Adam weight decay.")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Training device, for example cpu or cuda.",
-    )
+    parser.add_argument("--device", type=str, default=get_default_device_name(), help="Training device, for example cpu, mps, or cuda.")
+    # fmt: on
+
     return parser.parse_args()
 
 
