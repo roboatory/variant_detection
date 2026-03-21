@@ -27,32 +27,35 @@ def trim_cigar(
     trimmed_cigar = list()
 
     for op, length in segment.cigartuples:
-        if op in (
-            0,
-            2,
-            3,
-            7,
-            8,
-        ): # M, D, N, =, X: consumes reference (M, D, N, =, X) and possibly query (M, =, X)
+        if (
+            op
+            in (
+                0,
+                2,
+                3,
+                7,
+                8,
+            )
+        ):  # M, D, N, =, X: consumes reference (M, D, N, =, X) and possibly query (M, =, X)
             ref_end = ref_pos + length
 
             if ref_end > region_start and ref_pos < region_end:
                 # overlaps with region
-                if ref_pos < region_start: # trim left <..[..>..] or <..[...]..>
+                if ref_pos < region_start:  # trim left <..[..>..] or <..[...]..>
                     length -= region_start - ref_pos
 
-                if ref_end > region_end: # trim right [..<..]..> or <..[...]..>
+                if ref_end > region_end:  # trim right [..<..]..> or <..[...]..>
                     length -= ref_end - region_end
 
                 trimmed_cigar.append((op, length))
 
             ref_pos = ref_end
 
-        elif op in (1, 4, 5): # I, S, H: consumes query only
+        elif op in (1, 4, 5):  # I, S, H: consumes query only
             if ref_pos >= region_start and ref_pos < region_end:
                 trimmed_cigar.append((op, length))
 
-        elif op in (6, 9): # P, B: consumes neither reference nor query
+        elif op in (6, 9):  # P, B: consumes neither reference nor query
             continue
 
         else:
@@ -74,12 +77,12 @@ def parse_mdtag(
 
     md_tokens = list()
     for match in md_pattern.finditer(md_string):
-        if match.group(1): # number of matches
+        if match.group(1):  # number of matches
             md_tokens.append(("=", int(match.group(1))))
-        elif match.group(2): # deletion
-            deletion_seq = match.group(2)[1:] # remove '^'
+        elif match.group(2):  # deletion
+            deletion_seq = match.group(2)[1:]  # remove '^'
             md_tokens.append(("D", len(deletion_seq)))
-        elif match.group(3): # mismatch
+        elif match.group(3):  # mismatch
             md_tokens.append(("X", 1))
 
     return md_tokens
@@ -100,15 +103,15 @@ def trim_mdtag(
     trimmed_md = list()
 
     for op, length in md_tokens:
-        if op in ("=", "X", "D"): # consumes reference
+        if op in ("=", "X", "D"):  # consumes reference
             ref_end = ref_pos + length
 
             if ref_end > region_start and ref_pos < region_end:
                 # overlaps with region
-                if ref_pos < region_start: # trim left <..[..>..] or <..[...]..>
+                if ref_pos < region_start:  # trim left <..[..>..] or <..[...]..>
                     length -= region_start - ref_pos
 
-                if ref_end > region_end: # trim right [..<..]..> or <..[...]..>
+                if ref_end > region_end:  # trim right [..<..]..> or <..[...]..>
                     length -= ref_end - region_end
 
                 trimmed_md.append((op, length))
@@ -132,50 +135,55 @@ def update_feature_matrix(
     #      0              1              2               3               4             5             6            7         8
     # MISMATCHCOUNT, DELETIONCOUNT, SOFTHARDCOUNT, INSERTIONCOUNT, INSERTIONMEAN, INSERTIONMAX, DELETIONMEAN, DELETIONMAX, DEPTH
 
-    feature_mat[related_start:related_end, 8] += 1 # depth
+    feature_mat[related_start:related_end, 8] += 1  # depth
 
     start = related_start
 
     for op, length in trimmed_cigar:
-        if op in (
-            0,
-            2,
-            3,
-            7,
-            8,
-        ): # M, D, N, =, X: consumes reference (M, D, N, =, X) and possibly query (M, =, X)
+        if (
+            op
+            in (
+                0,
+                2,
+                3,
+                7,
+                8,
+            )
+        ):  # M, D, N, =, X: consumes reference (M, D, N, =, X) and possibly query (M, =, X)
             end = start + length
-        elif op in (1, 4, 5): # I, S, H: consumes query only
+        elif op in (1, 4, 5):  # I, S, H: consumes query only
             end = start
         else:
             raise ValueError(f"Unsupported CIGAR operation: {op}")
 
-        if op == 2: # deletion
-            feature_mat[start:end, 1] += 1 # deletion count
-            feature_mat[start:end, 6] += length # deletion mean (will divide later)
-            feature_mat[start:end, 7] = np.maximum(feature_mat[start:end, 7], length) # deletion max
+        if op == 2:  # deletion
+            feature_mat[start:end, 1] += 1  # deletion count
+            feature_mat[start:end, 6] += length  # deletion mean (will divide later)
+            feature_mat[start:end, 7] = np.maximum(
+                feature_mat[start:end, 7], length
+            )  # deletion max
 
-        elif op == 1: # insertion
-            feature_mat[start, 3] += 1 # insertion count
-            feature_mat[start, 4] += length # insertion mean (will divide later)
+        elif op == 1:  # insertion
+            feature_mat[start, 3] += 1  # insertion count
+            feature_mat[start, 4] += length  # insertion mean (will divide later)
             feature_mat[start, 5] = np.maximum(
                 feature_mat[start, 5], length
-            ) # insertion max
+            )  # insertion max
 
-        elif op in (4, 5): # soft clip or hard clip
-            feature_mat[start, 2] += 1 # soft hard count
+        elif op in (4, 5):  # soft clip or hard clip
+            feature_mat[start, 2] += 1  # soft hard count
 
         start = end
 
-    start = related_start # reset start for MD tag processing
+    start = related_start  # reset start for MD tag processing
     for op, length in trimmed_md:
-        if op in ("=", "X", "D"): # consumes reference
+        if op in ("=", "X", "D"):  # consumes reference
             end = start + length
         else:
             raise ValueError(f"Unsupported MD operation: {op}")
 
-        if op == "X": # mismatch
-            feature_mat[start:end, 0] += 1 # mismatch count
+        if op == "X":  # mismatch
+            feature_mat[start:end, 0] += 1  # mismatch count
 
         start = end
 
@@ -200,7 +208,7 @@ def main(
     region_length = region_end - region_start
     feature_matrix = np.zeros(
         (region_length, 9), dtype=np.float16
-    ) # 9 features as defined
+    )  # 9 features as defined
 
     for segment in bam.fetch(contig, region_start, region_end):
         if segment.is_unmapped:
@@ -222,14 +230,14 @@ def main(
 
         feature_matrix[:, 4] = np.where(
             insertion_counts > 0, feature_matrix[:, 4] / insertion_counts, 0
-        ) # insertion mean
+        )  # insertion mean
         feature_matrix[:, 6] = np.where(
             deletion_counts > 0, feature_matrix[:, 6] / deletion_counts, 0
-        ) # deletion mean
+        )  # deletion mean
 
     for start in list(range(0, region_length + 1, window_size))[
         :-1
-    ]: # exclude last window if smaller than window size
+    ]:  # exclude last window if smaller than window size
         end = start + window_size
         window_features = feature_matrix[start:end]
 
@@ -240,7 +248,8 @@ def main(
 
         window_index = region_start + start
         output_path = os.path.join(
-            output_directory, f"{contig}_{window_index}_{window_index + (end - start)}.npy"
+            output_directory,
+            f"{contig}_{window_index}_{window_index + (end - start)}.npy",
         )
 
         np.save(output_path, normalized_features)
@@ -281,6 +290,7 @@ def main(
             print("seaborn or matplotlib not installed, skipping heatmap generation.")
 
     bam.close()
+
 
 def parse_arguments() -> argparse.Namespace:
     # fmt: off
