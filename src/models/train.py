@@ -243,14 +243,12 @@ class MetricsAccumulator:
 
 def create_dataloader(
     split_directory: Path,
-    labels_file_path: Path | None,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
 ) -> DataLoader[tuple[Tensor, Tensor]]:
     resolved_labels_file_path = resolve_labels_file_path(
         split_directory=split_directory,
-        labels_file_path=labels_file_path,
     )
     labels = load_labels(resolved_labels_file_path)
     dataset = SVWindowDataset(split_directory=split_directory, labels=labels)
@@ -263,13 +261,7 @@ def create_dataloader(
     )
 
 
-def resolve_labels_file_path(
-    split_directory: Path,
-    labels_file_path: Path | None,
-) -> Path:
-    if labels_file_path is not None:
-        return labels_file_path
-
+def resolve_labels_file_path(split_directory: Path) -> Path:
     candidate_paths = [
         split_directory / "labels.txt",
         split_directory.parent / "labels.txt",
@@ -366,7 +358,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_directory", dest="train_directory", type=Path, required=True, help="Directory of training .npy files.")
     parser.add_argument("--validation_directory", dest="validation_directory", type=Path, required=True, help="Directory of validation .npy files.")
     parser.add_argument("--test_directory", dest="test_directory", type=Path, required=True, help="Directory of test .npy files.")
-    parser.add_argument("--labels_file_path", dest="labels_file_path", type=Path, default=None, help="Optional path to a shared labels.txt. If omitted, labels.txt is resolved per split.")
     parser.add_argument("--output_directory", dest="output_directory", type=Path, required=True, help="Directory for checkpoints and metrics.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
@@ -391,21 +382,18 @@ def train(arguments: argparse.Namespace) -> dict[str, Any]:
     try:
         train_loader = create_dataloader(
             split_directory=arguments.train_directory,
-            labels_file_path=arguments.labels_file_path,
             batch_size=arguments.batch_size,
             shuffle=True,
             num_workers=arguments.num_workers,
         )
         validation_loader = create_dataloader(
             split_directory=arguments.validation_directory,
-            labels_file_path=arguments.labels_file_path,
             batch_size=arguments.batch_size,
             shuffle=False,
             num_workers=arguments.num_workers,
         )
         test_loader = create_dataloader(
             split_directory=arguments.test_directory,
-            labels_file_path=arguments.labels_file_path,
             batch_size=arguments.batch_size,
             shuffle=False,
             num_workers=arguments.num_workers,
