@@ -8,10 +8,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
-try:
-    from .architecture import SVHunterModel
-except ImportError:
-    from architecture import SVHunterModel
+from architecture import SVHunterModel
 
 
 EXPECTED_INPUT_SHAPE = (2000, 9)

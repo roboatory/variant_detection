@@ -11,6 +11,7 @@ dependencies = [
     "pysam>=0.23.3",
     "seaborn>=0.13.2",
     "torch>=2.10.0",
+    "wandb>=0.23.0",
 ]
 
 [dependency-groups]

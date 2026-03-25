@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import wandb
 from torch import Tensor, nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
@@ -41,6 +42,17 @@ def set_seed(seed: int) -> None:
 
 def safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
+
+
+def serialize_arguments(arguments: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(arguments).items()
+    }
+
+
+def prefix_metrics(prefix: str, metrics: EpochMetrics) -> dict[str, float]:
+    return {f"{prefix}/{key}": value for key, value in asdict(metrics).items()}
 
 
 def parse_label_vector(label_text: str) -> Tensor:
@@ -308,16 +320,12 @@ def save_checkpoint(
     metrics: EpochMetrics,
     args: argparse.Namespace,
 ) -> None:
-    serialized_args = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
-    }
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "metrics": asdict(metrics),
-        "args": serialized_args,
+        "args": serialize_arguments(args),
     }
     torch.save(checkpoint, path)
 
@@ -325,6 +333,30 @@ def save_checkpoint(
 def write_json(output_file_path: Path, payload: Any) -> None:
     with output_file_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def initialize_wandb(arguments: argparse.Namespace) -> wandb.sdk.wandb_run.Run | None:
+    if arguments.wandb_mode == "disabled":
+        return None
+
+    init_kwargs = {
+        "project": arguments.wandb_project,
+        "name": arguments.wandb_run_name,
+        "mode": arguments.wandb_mode,
+        "anonymous": "allow",
+        "config": serialize_arguments(arguments),
+    }
+    try:
+        run = wandb.init(**init_kwargs)
+    except wandb.errors.UsageError:
+        if arguments.wandb_mode != "online":
+            raise
+        print("wandb online init failed; retrying in offline mode")
+        run = wandb.init(**{**init_kwargs, "mode": "offline"})
+
+    run.define_metric("epoch")
+    run.define_metric("*", step_metric="epoch")
+    return run
 
 
 def parse_args() -> argparse.Namespace:
@@ -343,6 +375,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--device", type=str, default=get_default_device_name(), help="Training device, for example cpu, mps, or cuda.")
+    parser.add_argument("--wandb_mode", type=str, choices=("online", "offline", "disabled"), default="online", help="Weights & Biases logging mode.")
+    parser.add_argument("--wandb_project", type=str, default="structural-variant-detection", help="Weights & Biases project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional Weights & Biases run name.")
     # fmt: on
 
     return parser.parse_args()
@@ -351,128 +386,153 @@ def parse_args() -> argparse.Namespace:
 def train(arguments: argparse.Namespace) -> dict[str, Any]:
     set_seed(arguments.seed)
     arguments.output_directory.mkdir(parents=True, exist_ok=True)
+    wandb_run = initialize_wandb(arguments)
 
-    train_loader = create_dataloader(
-        split_directory=arguments.train_directory,
-        labels_file_path=arguments.labels_file_path,
-        batch_size=arguments.batch_size,
-        shuffle=True,
-        num_workers=arguments.num_workers,
-    )
-    validation_loader = create_dataloader(
-        split_directory=arguments.validation_directory,
-        labels_file_path=arguments.labels_file_path,
-        batch_size=arguments.batch_size,
-        shuffle=False,
-        num_workers=arguments.num_workers,
-    )
-    test_loader = create_dataloader(
-        split_directory=arguments.test_directory,
-        labels_file_path=arguments.labels_file_path,
-        batch_size=arguments.batch_size,
-        shuffle=False,
-        num_workers=arguments.num_workers,
-    )
-
-    device = torch.device(arguments.device)
-    model = SVHunterModel().to(device)
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = Adam(
-        model.parameters(),
-        lr=arguments.learning_rate,
-        weight_decay=arguments.weight_decay,
-    )
-
-    best_validation_f1 = float("-inf")
-    history: list[dict[str, Any]] = []
-
-    for epoch in range(1, arguments.epochs + 1):
-        train_metrics = run_epoch(
-            model=model,
-            dataloader=train_loader,
-            criterion=criterion,
-            device=device,
-            optimizer=optimizer,
+    try:
+        train_loader = create_dataloader(
+            split_directory=arguments.train_directory,
+            labels_file_path=arguments.labels_file_path,
+            batch_size=arguments.batch_size,
+            shuffle=True,
+            num_workers=arguments.num_workers,
         )
-        validation_metrics = run_epoch(
+        validation_loader = create_dataloader(
+            split_directory=arguments.validation_directory,
+            labels_file_path=arguments.labels_file_path,
+            batch_size=arguments.batch_size,
+            shuffle=False,
+            num_workers=arguments.num_workers,
+        )
+        test_loader = create_dataloader(
+            split_directory=arguments.test_directory,
+            labels_file_path=arguments.labels_file_path,
+            batch_size=arguments.batch_size,
+            shuffle=False,
+            num_workers=arguments.num_workers,
+        )
+
+        device = torch.device(arguments.device)
+        model = SVHunterModel().to(device)
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = Adam(
+            model.parameters(),
+            lr=arguments.learning_rate,
+            weight_decay=arguments.weight_decay,
+        )
+
+        best_validation_f1 = float("-inf")
+        history: list[dict[str, Any]] = []
+
+        for epoch in range(1, arguments.epochs + 1):
+            train_metrics = run_epoch(
+                model=model,
+                dataloader=train_loader,
+                criterion=criterion,
+                device=device,
+                optimizer=optimizer,
+            )
+            validation_metrics = run_epoch(
+                model=model,
+                dataloader=validation_loader,
+                criterion=criterion,
+                device=device,
+                optimizer=None,
+            )
+
+            epoch_record = {
+                "epoch": epoch,
+                "train": asdict(train_metrics),
+                "val": asdict(validation_metrics),
+            }
+            history.append(epoch_record)
+            print(
+                f"epoch={epoch} "
+                f"train_loss={train_metrics.loss:.4f} "
+                f"val_loss={validation_metrics.loss:.4f} "
+                f"val_elementwise_f1={validation_metrics.elementwise_f1:.4f}"
+            )
+
+            if validation_metrics.elementwise_f1 > best_validation_f1:
+                best_validation_f1 = validation_metrics.elementwise_f1
+                save_checkpoint(
+                    path=arguments.output_directory / "best_model.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    metrics=validation_metrics,
+                    args=arguments,
+                )
+
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "epoch": epoch,
+                        **prefix_metrics("train", train_metrics),
+                        **prefix_metrics("val", validation_metrics),
+                        "best/validation_elementwise_f1": best_validation_f1,
+                    }
+                )
+
+        final_validation_metrics = run_epoch(
             model=model,
             dataloader=validation_loader,
             criterion=criterion,
             device=device,
             optimizer=None,
         )
-
-        epoch_record = {
-            "epoch": epoch,
-            "train": asdict(train_metrics),
-            "val": asdict(validation_metrics),
-        }
-        history.append(epoch_record)
-        print(
-            f"epoch={epoch} "
-            f"train_loss={train_metrics.loss:.4f} "
-            f"val_loss={validation_metrics.loss:.4f} "
-            f"val_elementwise_f1={validation_metrics.elementwise_f1:.4f}"
+        save_checkpoint(
+            path=arguments.output_directory / "final_model.pt",
+            model=model,
+            optimizer=optimizer,
+            epoch=arguments.epochs,
+            metrics=final_validation_metrics,
+            args=arguments,
         )
 
-        if validation_metrics.elementwise_f1 > best_validation_f1:
-            best_validation_f1 = validation_metrics.elementwise_f1
-            save_checkpoint(
-                path=arguments.output_directory / "best_model.pt",
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                metrics=validation_metrics,
-                args=arguments,
+        best_checkpoint = torch.load(
+            arguments.output_directory / "best_model.pt",
+            map_location=device,
+            weights_only=False,
+        )
+        model.load_state_dict(best_checkpoint["model_state_dict"])
+        test_metrics = run_epoch(
+            model=model,
+            dataloader=test_loader,
+            criterion=criterion,
+            device=device,
+            optimizer=None,
+        )
+
+        results = {
+            "best_validation_elementwise_f1": best_validation_f1,
+            "test_metrics": asdict(test_metrics),
+            "history": history,
+        }
+        write_json(arguments.output_directory / "history.json", history)
+        write_json(
+            arguments.output_directory / "test_metrics.json", asdict(test_metrics)
+        )
+        write_json(arguments.output_directory / "run_summary.json", results)
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {"epoch": arguments.epochs, **prefix_metrics("test", test_metrics)}
             )
+            wandb_run.summary["best_validation_elementwise_f1"] = best_validation_f1
+            for key, value in prefix_metrics("test", test_metrics).items():
+                wandb_run.summary[key] = value
 
-    final_validation_metrics = run_epoch(
-        model=model,
-        dataloader=validation_loader,
-        criterion=criterion,
-        device=device,
-        optimizer=None,
-    )
-    save_checkpoint(
-        path=arguments.output_directory / "final_model.pt",
-        model=model,
-        optimizer=optimizer,
-        epoch=arguments.epochs,
-        metrics=final_validation_metrics,
-        args=arguments,
-    )
-
-    best_checkpoint = torch.load(
-        arguments.output_directory / "best_model.pt",
-        map_location=device,
-        weights_only=False,
-    )
-    model.load_state_dict(best_checkpoint["model_state_dict"])
-    test_metrics = run_epoch(
-        model=model,
-        dataloader=test_loader,
-        criterion=criterion,
-        device=device,
-        optimizer=None,
-    )
-
-    results = {
-        "best_validation_elementwise_f1": best_validation_f1,
-        "test_metrics": asdict(test_metrics),
-        "history": history,
-    }
-    write_json(arguments.output_directory / "history.json", history)
-    write_json(arguments.output_directory / "test_metrics.json", asdict(test_metrics))
-    write_json(arguments.output_directory / "run_summary.json", results)
-
-    print(
-        "test "
-        f"loss={test_metrics.loss:.4f} "
-        f"elementwise_f1={test_metrics.elementwise_f1:.4f} "
-        f"exact_match_accuracy={test_metrics.exact_match_accuracy:.4f} "
-        f"any_sv_f1={test_metrics.any_sv_f1:.4f}"
-    )
-    return results
+        print(
+            "test "
+            f"loss={test_metrics.loss:.4f} "
+            f"elementwise_f1={test_metrics.elementwise_f1:.4f} "
+            f"exact_match_accuracy={test_metrics.exact_match_accuracy:.4f} "
+            f"any_sv_f1={test_metrics.any_sv_f1:.4f}"
+        )
+        return results
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 def main() -> None:

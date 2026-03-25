@@ -25,19 +25,6 @@ class ChannelAttention(nn.Module):
         return x * attention
 
 
-# class SpatialAttention(nn.Module):
-#     def __init__(self, kernel_size: tuple[int, int] = (2, 9)) -> None:
-#         super().__init__()
-#         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding="same", bias=False)
-#         self.activation = nn.Sigmoid()
-
-#     def forward(self, x: Tensor) -> Tensor:
-#         mean_map = torch.mean(x, dim=1, keepdim=True)
-#         max_map, _ = torch.max(x, dim=1, keepdim=True)
-#         attention = torch.cat([mean_map, max_map], dim=1)
-#         attention = self.activation(self.conv(attention))
-#         return x * attention
-    
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size: tuple[int, int] = (7, 1)) -> None:
         super().__init__()
@@ -72,45 +59,22 @@ class CBAMBlock(nn.Module):
 class SVHunterSubwindowEncoder(nn.Module):
     def __init__(self, num_features: int = 9) -> None:
         super().__init__()
-        # self.layers = nn.Sequential(
-        #     nn.Conv2d(1, 128, kernel_size=(2, num_features), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        #     nn.Conv2d(128, 64, kernel_size=(2, 1), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        #     CBAMBlock(64, reduction_ratio=7, spatial_kernel_size=(2, num_features)),
-        #     nn.Conv2d(64, 64, kernel_size=(2, 1), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        #     nn.Conv2d(64, 64, kernel_size=(2, 1), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        #     CBAMBlock(64, reduction_ratio=7, spatial_kernel_size=(2, num_features)),
-        #     nn.Conv2d(64, 64, kernel_size=(2, 1), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        #     nn.Conv2d(64, 64, kernel_size=(2, 1), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        #     CBAMBlock(64, reduction_ratio=7, spatial_kernel_size=(2, num_features)),
-        #     nn.Conv2d(64, 64, kernel_size=(2, 1), padding="same"),
-        #     nn.MaxPool2d(kernel_size=(2, 1)),
-        # )
-        # self.output_dimension = 64 * num_features
-
         self.layers = nn.Sequential(
-            nn.Conv2d(1, 128, kernel_size=(1, num_features), padding="valid"), # 200
-            nn.MaxPool2d(kernel_size=(2, 1)), # 100
-            nn.Conv2d(128, 64, kernel_size=(3, 1), padding="valid"), # 98
-            nn.MaxPool2d(kernel_size=(2, 1)), # 49
-            # CBAMBlock(64, reduction_ratio=7, spatial_kernel_size=(7, 1)), # 49
+            nn.Conv2d(1, 128, kernel_size=(1, num_features), padding="valid"),  # 200
+            nn.MaxPool2d(kernel_size=(2, 1)),  # 100
+            nn.Conv2d(128, 64, kernel_size=(3, 1), padding="valid"),  # 98
+            nn.MaxPool2d(kernel_size=(2, 1)),  # 49
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"), # 48
-            nn.MaxPool2d(kernel_size=(2, 1)), # 24
-            nn.Conv2d(64, 64, kernel_size=(3, 1), padding="valid"), # 22
-            nn.MaxPool2d(kernel_size=(2, 1)), # 11
-            # CBAMBlock(64, reduction_ratio=7, spatial_kernel_size=(3, 1)), # 11
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),  # 48
+            nn.MaxPool2d(kernel_size=(2, 1)),  # 24
+            nn.Conv2d(64, 64, kernel_size=(3, 1), padding="valid"),  # 22
+            nn.MaxPool2d(kernel_size=(2, 1)),  # 11
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"), # 10
-            nn.MaxPool2d(kernel_size=(2, 1)), # 5
-            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"), # 4
-            nn.MaxPool2d(kernel_size=(2, 1)), # 2
-            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"), # 1
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),  # 10
+            nn.MaxPool2d(kernel_size=(2, 1)),  # 5
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),  # 4
+            nn.MaxPool2d(kernel_size=(2, 1)),  # 2
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),  # 1
         )
         self.output_dimension = 64
 
@@ -215,10 +179,8 @@ class SVHunterModel(nn.Module):
         subwindow_size: int = 200,
         num_subwindows: int = 10,
         embedding_dimension: int = 100,
-        # num_heads: int = 32,
         num_heads: int = 4,
         key_dimension: int = 32,
-        # num_transformer_blocks: int = 7,
         num_transformer_blocks: int = 3,
         multilayer_perceptron_hidden_dimension: int = 128,
         attention_dropout: float = 0.3,
@@ -252,10 +214,6 @@ class SVHunterModel(nn.Module):
         )
         self.sequence_normalization = nn.LayerNorm(embedding_dimension)
         self.classifier = nn.Sequential(
-            # nn.Linear(
-            #     num_subwindows * embedding_dimension,
-            #     multilayer_perceptron_hidden_dimension,
-            # ),
             nn.Linear(
                 embedding_dimension,
                 multilayer_perceptron_hidden_dimension,
@@ -268,7 +226,6 @@ class SVHunterModel(nn.Module):
             ),
             nn.ReLU(inplace=True),
             nn.Dropout(head_dropout),
-            # nn.Linear(multilayer_perceptron_hidden_dimension, num_subwindows),
             nn.Linear(multilayer_perceptron_hidden_dimension, 1),
         )
 
@@ -296,6 +253,4 @@ class SVHunterModel(nn.Module):
             x = block(x)
 
         x = self.sequence_normalization(x)
-        # x = torch.flatten(x, start_dim=1)
-        # return self.classifier(x)
-        return self.classifier(x).squeeze(-1) # shape (batch, num_subwindows, 1) → (batch, num_subwindows)
+        return self.classifier(x).squeeze(-1)
