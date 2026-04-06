@@ -5,57 +5,6 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 
-class ChannelAttention(nn.Module):
-    def __init__(self, channels: int, reduction_ratio: int = 7) -> None:
-        super().__init__()
-        reduced_channels = max(1, channels // reduction_ratio)
-        self.average_pool = nn.AdaptiveAvgPool2d(1)
-        self.maximum_pool = nn.AdaptiveMaxPool2d(1)
-        self.multilayer_perceptron = nn.Sequential(
-            nn.Conv2d(channels, reduced_channels, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(reduced_channels, channels, kernel_size=1, bias=True),
-        )
-        self.activation = nn.Sigmoid()
-
-    def forward(self, x: Tensor) -> Tensor:
-        average_attention = self.multilayer_perceptron(self.average_pool(x))
-        maximum_attention = self.multilayer_perceptron(self.maximum_pool(x))
-        attention = self.activation(average_attention + maximum_attention)
-        return x * attention
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size: tuple[int, int] = (7, 1)) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding="same", bias=False)
-        self.activation = nn.Sigmoid()
-
-    def forward(self, x: Tensor) -> Tensor:
-        mean_map = torch.mean(x, dim=1, keepdim=True)
-        max_map, _ = torch.max(x, dim=1, keepdim=True)
-        attention = torch.cat([mean_map, max_map], dim=1)
-        attention = self.activation(self.conv(attention))
-        return x * attention
-
-
-class CBAMBlock(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        reduction_ratio: int = 7,
-        spatial_kernel_size: tuple[int, int] = (7, 1),
-    ) -> None:
-        super().__init__()
-        self.channel_attention = ChannelAttention(channels, reduction_ratio)
-        self.spatial_attention = SpatialAttention(spatial_kernel_size)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
-
-
 class SVHunterSubwindowEncoder(nn.Module):
     def __init__(self, num_features: int = 9) -> None:
         super().__init__()
