@@ -9,7 +9,8 @@ import time
 
 import torch
 from torch import Tensor, nn
-from torch.optim import Adam
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from prepare import (
     DEFAULT_TRAIN_DIRECTORY,
@@ -221,9 +222,9 @@ ATTENTION_DROPOUT = 0.3
 HEAD_DROPOUT = 0.4
 
 # Optimization
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 1e-3
 MAX_EPOCHS = 100  # upper bound on epochs (may stop earlier via time budget)
 
 # Misc
@@ -261,11 +262,12 @@ num_params = sum(p.numel() for p in model.parameters())
 print(f"Parameters: {num_params:,}")
 
 criterion = nn.BCEWithLogitsLoss()
-optimizer = Adam(
+optimizer = AdamW(
     model.parameters(),
     lr=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY,
 )
+scheduler = CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS, eta_min=1e-6)
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -301,6 +303,8 @@ for epoch in range(1, MAX_EPOCHS + 1):
         criterion=criterion,
         device=device,
     )
+
+    scheduler.step()
 
     t_epoch_end = time.time()
     total_training_time += t_epoch_end - t_epoch_start
