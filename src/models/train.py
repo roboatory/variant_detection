@@ -298,7 +298,6 @@ for epoch in range(1, MAX_EPOCHS + 1):
         loss = criterion(logits, labels)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         accumulator.update(loss.item(), logits.detach(), labels.detach())
     train_metrics = accumulator.compute()
