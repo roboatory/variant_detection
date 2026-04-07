@@ -213,13 +213,13 @@ NUM_FEATURES = 9
 INPUT_LENGTH = 2000
 SUBWINDOW_SIZE = 200
 NUM_SUBWINDOWS = 10
-EMBEDDING_DIMENSION = 100
+EMBEDDING_DIMENSION = 128
 NUM_HEADS = 4
 KEY_DIMENSION = 32
-NUM_TRANSFORMER_BLOCKS = 3
+NUM_TRANSFORMER_BLOCKS = 4
 MLP_HIDDEN_DIMENSION = 128
-ATTENTION_DROPOUT = 0.3
-HEAD_DROPOUT = 0.4
+ATTENTION_DROPOUT = 0.2
+HEAD_DROPOUT = 0.3
 
 # Optimization
 BATCH_SIZE = 64
@@ -292,6 +292,7 @@ for epoch in range(1, MAX_EPOCHS + 1):
         loss = criterion(logits, labels)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         accumulator.update(loss.item(), logits.detach(), labels.detach())
     train_metrics = accumulator.compute()
