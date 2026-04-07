@@ -150,6 +150,7 @@ class SVHunterModel(nn.Module):
         if INPUT_LENGTH != SUBWINDOW_SIZE * NUM_SUBWINDOWS:
             raise ValueError("INPUT_LENGTH must equal SUBWINDOW_SIZE * NUM_SUBWINDOWS")
 
+        self.input_norm = nn.LayerNorm(NUM_FEATURES)
         self.encoder = SVHunterSubwindowEncoder(num_features=NUM_FEATURES)
         self.patch_projection = nn.Linear(
             self.encoder.output_dimension, EMBEDDING_DIMENSION
@@ -188,6 +189,7 @@ class SVHunterModel(nn.Module):
             )
 
         batch_size = x.shape[0]
+        x = self.input_norm(x)
         x = x.view(batch_size, NUM_SUBWINDOWS, SUBWINDOW_SIZE, NUM_FEATURES)
         x = x.unsqueeze(2).reshape(
             batch_size * NUM_SUBWINDOWS, 1, SUBWINDOW_SIZE, NUM_FEATURES
@@ -218,8 +220,8 @@ NUM_HEADS = 4
 KEY_DIMENSION = 32
 NUM_TRANSFORMER_BLOCKS = 4
 MLP_HIDDEN_DIMENSION = 128
-ATTENTION_DROPOUT = 0.2
-HEAD_DROPOUT = 0.3
+ATTENTION_DROPOUT = 0.1
+HEAD_DROPOUT = 0.2
 
 # Optimization
 BATCH_SIZE = 64
