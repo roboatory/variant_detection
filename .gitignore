@@ -17,3 +17,7 @@ data/
 output/
 plans/
 wandb/
+
+# Autoresearch
+results.tsv
+run.log

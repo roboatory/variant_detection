@@ -1,549 +1,345 @@
+"""Autoresearch-compatible training script for SV detection.
+
+This is the file the AI agent edits. It contains:
+- Model architecture (SVHunterModel and all sub-modules)
+- Optimizer configuration
+- Training loop
+- Hyperparameters as top-level constants
+
+Run: uv run python src/models/train.py > run.log 2>&1
+Grep: grep "^val_elementwise_f1:" run.log
+"""
+
 from __future__ import annotations
 
-import argparse
-import json
-import random
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
+import sys
+import time
 
-import numpy as np
 import torch
-import wandb
 from torch import Tensor, nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Dataset
 
-try:
-    from .architecture import SVHunterModel
-except ImportError:
-    from architecture import SVHunterModel
+from prepare import (
+    DEFAULT_TRAIN_DIRECTORY,
+    DEFAULT_VALIDATION_DIRECTORY,
+    EpochMetrics,
+    MetricsAccumulator,
+    create_dataloader,
+    evaluate,
+    get_default_device_name,
+    print_summary,
+    set_seed,
+)
 
+# ===== HYPERPARAMETERS (edit these) ==========================================
 
-EXPECTED_INPUT_SHAPE = (2000, 9)
-EXPECTED_LABEL_LENGTH = 10
+SEED = 42
+EPOCHS = 20
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 0.0
+NUM_WORKERS = 0
+MAX_SAMPLES = None
 
+# model
+NUM_FEATURES = 9
+INPUT_LENGTH = 2000
+SUBWINDOW_SIZE = 200
+NUM_SUBWINDOWS = 10
+EMBEDDING_DIMENSION = 100
+NUM_HEADS = 4
+KEY_DIMENSION = 32
+NUM_TRANSFORMER_BLOCKS = 3
+MLP_HIDDEN_DIMENSION = 128
+ATTENTION_DROPOUT = 0.3
+HEAD_DROPOUT = 0.4
 
-def get_default_device_name() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def safe_divide(numerator: float, denominator: float) -> float:
-    return numerator / denominator if denominator else 0.0
-
-
-def serialize_arguments(arguments: argparse.Namespace) -> dict[str, Any]:
-    return {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(arguments).items()
-    }
-
-
-def prefix_metrics(prefix: str, metrics: EpochMetrics) -> dict[str, float]:
-    return {f"{prefix}/{key}": value for key, value in asdict(metrics).items()}
+# ===== MODEL ARCHITECTURE ====================================================
 
 
-def parse_label_vector(label_text: str) -> Tensor:
-    label_parts = [label_part.strip() for label_part in label_text.split(",")]
-    if len(label_parts) != EXPECTED_LABEL_LENGTH:
-        raise ValueError(
-            f"Expected {EXPECTED_LABEL_LENGTH} labels per example, got {len(label_parts)}"
+class SVHunterSubwindowEncoder(nn.Module):
+    def __init__(self, num_features: int = NUM_FEATURES) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(1, 128, kernel_size=(1, num_features), padding="valid"),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(128, 64, kernel_size=(3, 1), padding="valid"),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(64, 64, kernel_size=(3, 1), padding="valid"),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),
+            nn.MaxPool2d(kernel_size=(2, 1)),
+            nn.Conv2d(64, 64, kernel_size=(2, 1), padding="valid"),
         )
+        self.output_dimension = 64
 
-    values: list[float] = []
-    for label_part in label_parts:
-        if label_part not in {"0", "1"}:
-            raise ValueError(f"Labels must be binary 0/1 values, got {label_part!r}")
-        values.append(float(label_part))
-    return torch.tensor(values, dtype=torch.float32)
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.layers(x)
+        return torch.flatten(x, start_dim=1)
 
 
-def load_labels(labels_file_path: Path) -> dict[str, Tensor]:
-    if not labels_file_path.exists():
-        raise FileNotFoundError(f"Labels file not found: {labels_file_path}")
-
-    labels: dict[str, Tensor] = {}
-    with labels_file_path.open("r", encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            line_parts = line.split("\t")
-            if len(line_parts) != 2:
-                raise ValueError(
-                    f"Malformed labels.txt line {line_number}: expected <file>\\t<v0,...,v9>"
-                )
-            file_name, label_text = line_parts
-            file_basename = Path(file_name).name
-            label_vector = parse_label_vector(label_text)
-            if file_basename in labels:
-                if not torch.equal(labels[file_basename], label_vector):
-                    raise ValueError(f"Conflicting label entry for {file_basename}")
-                continue
-            labels[file_basename] = label_vector
-
-    if not labels:
-        raise ValueError("No labels were loaded from labels.txt")
-    return labels
-
-
-class SVWindowDataset(Dataset[tuple[Tensor, Tensor]]):
+class SVHunterMultiHeadAttention(nn.Module):
     def __init__(
         self,
-        split_directory: Path,
-        labels: dict[str, Tensor],
-        max_samples: int | None = None,
+        embedding_dimension: int = EMBEDDING_DIMENSION,
+        num_heads: int = NUM_HEADS,
+        key_dimension: int = KEY_DIMENSION,
+        dropout: float = ATTENTION_DROPOUT,
     ) -> None:
-        if not split_directory.exists():
-            raise FileNotFoundError(f"Split directory not found: {split_directory}")
-        if not split_directory.is_dir():
-            raise NotADirectoryError(f"Expected a directory: {split_directory}")
+        super().__init__()
+        self.embedding_dimension = embedding_dimension
+        self.num_heads = num_heads
+        self.key_dimension = key_dimension
+        self.attention_inner_dimension = num_heads * key_dimension
+        self.query_projection = nn.Linear(
+            embedding_dimension, self.attention_inner_dimension
+        )
+        self.key_projection = nn.Linear(
+            embedding_dimension, self.attention_inner_dimension
+        )
+        self.value_projection = nn.Linear(
+            embedding_dimension, self.attention_inner_dimension
+        )
+        self.output_projection = nn.Linear(
+            self.attention_inner_dimension, embedding_dimension
+        )
+        self.dropout = dropout
 
-        files = sorted(split_directory.glob("*.npy"))
-        if not files:
-            raise ValueError(
-                f"No .npy files found in split directory: {split_directory}"
-            )
-        if max_samples is not None:
-            if max_samples <= 0:
-                raise ValueError("--max_samples must be a positive integer")
-            files = files[:max_samples]
+    def forward(self, x: Tensor) -> Tensor:
+        batch_size, seq_len, _ = x.shape
+        query = self.query_projection(x).view(
+            batch_size, seq_len, self.num_heads, self.key_dimension
+        )
+        key = self.key_projection(x).view(
+            batch_size, seq_len, self.num_heads, self.key_dimension
+        )
+        value = self.value_projection(x).view(
+            batch_size, seq_len, self.num_heads, self.key_dimension
+        )
 
-        missing_labels = [path.name for path in files if path.name not in labels]
-        if missing_labels:
-            preview = ", ".join(missing_labels[:5])
-            raise ValueError(
-                f"Missing labels for {len(missing_labels)} files in {split_directory}: {preview}"
-            )
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
 
-        self.samples = [path for path in files if path.name in labels]
-        self.labels = labels
-
-        for sample_path in self.samples:
-            array = np.load(sample_path, mmap_mode="r")
-            if array.shape != EXPECTED_INPUT_SHAPE:
-                raise ValueError(
-                    f"{sample_path} has shape {array.shape}, expected {EXPECTED_INPUT_SHAPE}"
-                )
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
-        sample_path = self.samples[index]
-        features = np.load(sample_path).astype(np.float32, copy=False)
-        labels = self.labels[sample_path.name]
-        return torch.from_numpy(features), labels.clone()
-
-
-@dataclass
-class EpochMetrics:
-    loss: float
-    elementwise_precision: float
-    elementwise_recall: float
-    elementwise_f1: float
-    elementwise_accuracy: float
-    exact_match_accuracy: float
-    any_sv_precision: float
-    any_sv_recall: float
-    any_sv_f1: float
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = attention_output.view(
+            batch_size, seq_len, self.attention_inner_dimension
+        )
+        return self.output_projection(attention_output)
 
 
-class MetricsAccumulator:
+class SVHunterTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        embedding_dimension: int = EMBEDDING_DIMENSION,
+        num_heads: int = NUM_HEADS,
+        key_dimension: int = KEY_DIMENSION,
+        dropout: float = ATTENTION_DROPOUT,
+    ) -> None:
+        super().__init__()
+        self.layer_normalization_1 = nn.LayerNorm(embedding_dimension)
+        self.attention = SVHunterMultiHeadAttention(
+            embedding_dimension=embedding_dimension,
+            num_heads=num_heads,
+            key_dimension=key_dimension,
+            dropout=dropout,
+        )
+        self.layer_normalization_2 = nn.LayerNorm(embedding_dimension)
+        self.feed_forward_network = nn.Sequential(
+            nn.Linear(embedding_dimension, embedding_dimension),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_dimension, embedding_dimension),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attention(self.layer_normalization_1(x))
+        x = x + self.feed_forward_network(self.layer_normalization_2(x))
+        return x
+
+
+class SVHunterModel(nn.Module):
     def __init__(self) -> None:
-        self.loss_sum = 0.0
-        self.sample_count = 0
-        self.elementwise_true_positives = 0
-        self.elementwise_false_positives = 0
-        self.elementwise_false_negatives = 0
-        self.elementwise_correct = 0
-        self.elementwise_total = 0
-        self.exact_match_count = 0
-        self.any_sv_true_positives = 0
-        self.any_sv_false_positives = 0
-        self.any_sv_false_negatives = 0
+        super().__init__()
+        if INPUT_LENGTH != SUBWINDOW_SIZE * NUM_SUBWINDOWS:
+            raise ValueError("INPUT_LENGTH must equal SUBWINDOW_SIZE * NUM_SUBWINDOWS")
 
-    def update(self, loss: float, logits: Tensor, labels: Tensor) -> None:
-        batch_size = labels.shape[0]
-        self.loss_sum += loss * batch_size
-        self.sample_count += batch_size
-
-        probabilities = torch.sigmoid(logits)
-        predictions = (probabilities >= 0.5).to(dtype=torch.int64)
-        targets = labels.to(dtype=torch.int64)
-
-        self.elementwise_true_positives += int(
-            ((predictions == 1) & (targets == 1)).sum().item()
+        self.encoder = SVHunterSubwindowEncoder(num_features=NUM_FEATURES)
+        self.patch_projection = nn.Linear(
+            self.encoder.output_dimension, EMBEDDING_DIMENSION
         )
-        self.elementwise_false_positives += int(
-            ((predictions == 1) & (targets == 0)).sum().item()
+        self.position_embedding = nn.Parameter(
+            torch.zeros(1, NUM_SUBWINDOWS, EMBEDDING_DIMENSION)
         )
-        self.elementwise_false_negatives += int(
-            ((predictions == 0) & (targets == 1)).sum().item()
+        self.transformer_blocks = nn.ModuleList(
+            [
+                SVHunterTransformerBlock(
+                    embedding_dimension=EMBEDDING_DIMENSION,
+                    num_heads=NUM_HEADS,
+                    key_dimension=KEY_DIMENSION,
+                    dropout=ATTENTION_DROPOUT,
+                )
+                for _ in range(NUM_TRANSFORMER_BLOCKS)
+            ]
         )
-        self.elementwise_correct += int((predictions == targets).sum().item())
-        self.elementwise_total += int(targets.numel())
-        self.exact_match_count += int((predictions == targets).all(dim=1).sum().item())
-
-        any_predictions = predictions.any(dim=1).to(dtype=torch.int64)
-        any_targets = targets.any(dim=1).to(dtype=torch.int64)
-        self.any_sv_true_positives += int(
-            ((any_predictions == 1) & (any_targets == 1)).sum().item()
-        )
-        self.any_sv_false_positives += int(
-            ((any_predictions == 1) & (any_targets == 0)).sum().item()
-        )
-        self.any_sv_false_negatives += int(
-            ((any_predictions == 0) & (any_targets == 1)).sum().item()
+        self.sequence_normalization = nn.LayerNorm(EMBEDDING_DIMENSION)
+        self.classifier = nn.Sequential(
+            nn.Linear(EMBEDDING_DIMENSION, MLP_HIDDEN_DIMENSION),
+            nn.ReLU(inplace=True),
+            nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(MLP_HIDDEN_DIMENSION, MLP_HIDDEN_DIMENSION),
+            nn.ReLU(inplace=True),
+            nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(MLP_HIDDEN_DIMENSION, 1),
         )
 
-    def compute(self) -> EpochMetrics:
-        elementwise_precision = safe_divide(
-            self.elementwise_true_positives,
-            self.elementwise_true_positives + self.elementwise_false_positives,
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim != 3:
+            raise ValueError("Expected input shape (batch, 2000, 9)")
+        if x.shape[1] != INPUT_LENGTH or x.shape[2] != NUM_FEATURES:
+            raise ValueError(
+                f"Expected input shape (batch, {INPUT_LENGTH}, {NUM_FEATURES})"
+            )
+
+        batch_size = x.shape[0]
+        x = x.view(batch_size, NUM_SUBWINDOWS, SUBWINDOW_SIZE, NUM_FEATURES)
+        x = x.unsqueeze(2).reshape(
+            batch_size * NUM_SUBWINDOWS, 1, SUBWINDOW_SIZE, NUM_FEATURES
         )
-        elementwise_recall = safe_divide(
-            self.elementwise_true_positives,
-            self.elementwise_true_positives + self.elementwise_false_negatives,
-        )
-        elementwise_f1 = safe_divide(
-            2 * elementwise_precision * elementwise_recall,
-            elementwise_precision + elementwise_recall,
-        )
-        any_sv_precision = safe_divide(
-            self.any_sv_true_positives,
-            self.any_sv_true_positives + self.any_sv_false_positives,
-        )
-        any_sv_recall = safe_divide(
-            self.any_sv_true_positives,
-            self.any_sv_true_positives + self.any_sv_false_negatives,
-        )
-        any_sv_f1 = safe_divide(
-            2 * any_sv_precision * any_sv_recall,
-            any_sv_precision + any_sv_recall,
-        )
+        x = self.encoder(x)
+        x = x.view(batch_size, NUM_SUBWINDOWS, self.encoder.output_dimension)
+        x = self.patch_projection(x)
+        x = x + self.position_embedding
 
-        return EpochMetrics(
-            loss=safe_divide(self.loss_sum, self.sample_count),
-            elementwise_precision=elementwise_precision,
-            elementwise_recall=elementwise_recall,
-            elementwise_f1=elementwise_f1,
-            elementwise_accuracy=safe_divide(
-                self.elementwise_correct, self.elementwise_total
-            ),
-            exact_match_accuracy=safe_divide(self.exact_match_count, self.sample_count),
-            any_sv_precision=any_sv_precision,
-            any_sv_recall=any_sv_recall,
-            any_sv_f1=any_sv_f1,
-        )
+        for block in self.transformer_blocks:
+            x = block(x)
+
+        x = self.sequence_normalization(x)
+        return self.classifier(x).squeeze(-1)
 
 
-def create_dataloader(
-    split_directory: Path,
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-    max_samples: int | None = None,
-) -> DataLoader[tuple[Tensor, Tensor]]:
-    resolved_labels_file_path = resolve_labels_file_path(
-        split_directory=split_directory,
-    )
-    labels = load_labels(resolved_labels_file_path)
-    dataset = SVWindowDataset(
-        split_directory=split_directory,
-        labels=labels,
-        max_samples=max_samples,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+# ===== TRAINING LOOP =========================================================
 
 
-def resolve_labels_file_path(split_directory: Path) -> Path:
-    candidate_paths = [
-        split_directory / "labels.txt",
-        split_directory.parent / "labels.txt",
-    ]
-    for candidate_path in candidate_paths:
-        if candidate_path.exists():
-            return candidate_path
-
-    raise FileNotFoundError(
-        f"Could not find labels.txt for split directory {split_directory}"
-    )
-
-
-def run_epoch(
+def train_one_epoch(
     model: nn.Module,
-    dataloader: DataLoader[tuple[Tensor, Tensor]],
+    dataloader: torch.utils.data.DataLoader,
     criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
     device: torch.device,
-    optimizer: Adam | None = None,
 ) -> EpochMetrics:
-    training = optimizer is not None
-    model.train(training)
+    model.train()
     accumulator = MetricsAccumulator()
 
     for features, labels in dataloader:
         features = features.to(device=device, dtype=torch.float32, non_blocking=True)
         labels = labels.to(device=device, dtype=torch.float32, non_blocking=True)
 
-        with torch.set_grad_enabled(training):
-            logits = model(features)
-            loss = criterion(logits, labels)
+        logits = model(features)
+        loss = criterion(logits, labels)
 
-        if training:
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
 
         accumulator.update(loss.item(), logits.detach(), labels.detach())
 
     return accumulator.compute()
 
 
-def save_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: Adam,
-    epoch: int,
-    metrics: EpochMetrics,
-    args: argparse.Namespace,
-) -> None:
-    checkpoint = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "metrics": asdict(metrics),
-        "args": serialize_arguments(args),
-    }
-    torch.save(checkpoint, path)
+def main() -> None:
+    total_start = time.time()
+    set_seed(SEED)
 
+    device = torch.device(get_default_device_name())
 
-def write_json(output_file_path: Path, payload: Any) -> None:
-    with output_file_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+    train_loader = create_dataloader(
+        split_directory=DEFAULT_TRAIN_DIRECTORY,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        max_samples=MAX_SAMPLES,
+    )
+    validation_loader = create_dataloader(
+        split_directory=DEFAULT_VALIDATION_DIRECTORY,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        max_samples=MAX_SAMPLES,
+    )
 
+    model = SVHunterModel().to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
 
-def initialize_wandb(arguments: argparse.Namespace) -> wandb.sdk.wandb_run.Run | None:
-    if arguments.wandb_mode == "disabled":
-        return None
+    best_val_f1 = float("-inf")
+    best_val_metrics = None
+    training_start = time.time()
 
-    init_kwargs = {
-        "project": arguments.wandb_project,
-        "name": arguments.wandb_run_name,
-        "mode": arguments.wandb_mode,
-        "anonymous": "allow",
-        "config": serialize_arguments(arguments),
-    }
-    try:
-        run = wandb.init(**init_kwargs)
-    except wandb.errors.UsageError:
-        if arguments.wandb_mode != "online":
-            raise
-        print("wandb online init failed; retrying in offline mode")
-        run = wandb.init(**{**init_kwargs, "mode": "offline"})
-
-    run.define_metric("epoch")
-    run.define_metric("*", step_metric="epoch")
-    return run
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the adapted SVHunter model.")
-
-    # fmt: off
-    parser.add_argument("--train_directory", dest="train_directory", type=Path, required=True, help="Directory of training .npy files.")
-    parser.add_argument("--validation_directory", dest="validation_directory", type=Path, required=True, help="Directory of validation .npy files.")
-    parser.add_argument("--test_directory", dest="test_directory", type=Path, required=True, help="Directory of test .npy files.")
-    parser.add_argument("--output_directory", dest="output_directory", type=Path, required=True, help="Directory for checkpoints and metrics.")
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Adam learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Adam weight decay.")
-    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader worker processes.")
-    parser.add_argument("--max_samples", type=int, default=None, help="Optional cap on the number of samples loaded from each split for development and testing.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--device", type=str, default=get_default_device_name(), help="Training device, for example cpu, mps, or cuda.")
-    parser.add_argument("--wandb_mode", type=str, choices=("online", "offline", "disabled"), default="online", help="Weights & Biases logging mode.")
-    parser.add_argument("--wandb_project", type=str, default="structural-variant-detection", help="Weights & Biases project name.")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional Weights & Biases run name.")
-    # fmt: on
-
-    return parser.parse_args()
-
-
-def train(arguments: argparse.Namespace) -> dict[str, Any]:
-    set_seed(arguments.seed)
-    arguments.output_directory.mkdir(parents=True, exist_ok=True)
-    wandb_run = initialize_wandb(arguments)
-
-    try:
-        train_loader = create_dataloader(
-            split_directory=arguments.train_directory,
-            batch_size=arguments.batch_size,
-            shuffle=True,
-            num_workers=arguments.num_workers,
-            max_samples=arguments.max_samples,
+    for epoch in range(1, EPOCHS + 1):
+        train_metrics = train_one_epoch(
+            model=model,
+            dataloader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
         )
-        validation_loader = create_dataloader(
-            split_directory=arguments.validation_directory,
-            batch_size=arguments.batch_size,
-            shuffle=False,
-            num_workers=arguments.num_workers,
-            max_samples=arguments.max_samples,
-        )
-        test_loader = create_dataloader(
-            split_directory=arguments.test_directory,
-            batch_size=arguments.batch_size,
-            shuffle=False,
-            num_workers=arguments.num_workers,
-            max_samples=arguments.max_samples,
-        )
-
-        device = torch.device(arguments.device)
-        model = SVHunterModel().to(device)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = Adam(
-            model.parameters(),
-            lr=arguments.learning_rate,
-            weight_decay=arguments.weight_decay,
-        )
-
-        best_validation_f1 = float("-inf")
-        history: list[dict[str, Any]] = []
-
-        for epoch in range(1, arguments.epochs + 1):
-            train_metrics = run_epoch(
-                model=model,
-                dataloader=train_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=optimizer,
-            )
-            validation_metrics = run_epoch(
-                model=model,
-                dataloader=validation_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=None,
-            )
-
-            epoch_record = {
-                "epoch": epoch,
-                "train": asdict(train_metrics),
-                "val": asdict(validation_metrics),
-            }
-            history.append(epoch_record)
-            print(
-                f"epoch={epoch} "
-                f"train_loss={train_metrics.loss:.4f} "
-                f"val_loss={validation_metrics.loss:.4f} "
-                f"val_elementwise_f1={validation_metrics.elementwise_f1:.4f}"
-            )
-
-            if validation_metrics.elementwise_f1 > best_validation_f1:
-                best_validation_f1 = validation_metrics.elementwise_f1
-                save_checkpoint(
-                    path=arguments.output_directory / "best_model.pt",
-                    model=model,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    metrics=validation_metrics,
-                    args=arguments,
-                )
-
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "epoch": epoch,
-                        **prefix_metrics("train", train_metrics),
-                        **prefix_metrics("val", validation_metrics),
-                        "best/validation_elementwise_f1": best_validation_f1,
-                    }
-                )
-
-        final_validation_metrics = run_epoch(
+        val_metrics = evaluate(
             model=model,
             dataloader=validation_loader,
             criterion=criterion,
             device=device,
-            optimizer=None,
         )
-        save_checkpoint(
-            path=arguments.output_directory / "final_model.pt",
-            model=model,
-            optimizer=optimizer,
-            epoch=arguments.epochs,
-            metrics=final_validation_metrics,
-            args=arguments,
-        )
-
-        best_checkpoint = torch.load(
-            arguments.output_directory / "best_model.pt",
-            map_location=device,
-            weights_only=False,
-        )
-        model.load_state_dict(best_checkpoint["model_state_dict"])
-        test_metrics = run_epoch(
-            model=model,
-            dataloader=test_loader,
-            criterion=criterion,
-            device=device,
-            optimizer=None,
-        )
-
-        results = {
-            "best_validation_elementwise_f1": best_validation_f1,
-            "test_metrics": asdict(test_metrics),
-            "history": history,
-        }
-        write_json(arguments.output_directory / "history.json", history)
-        write_json(
-            arguments.output_directory / "test_metrics.json", asdict(test_metrics)
-        )
-        write_json(arguments.output_directory / "run_summary.json", results)
-
-        if wandb_run is not None:
-            wandb_run.log(
-                {"epoch": arguments.epochs, **prefix_metrics("test", test_metrics)}
-            )
-            wandb_run.summary["best_validation_elementwise_f1"] = best_validation_f1
-            for key, value in prefix_metrics("test", test_metrics).items():
-                wandb_run.summary[key] = value
 
         print(
-            "test "
-            f"loss={test_metrics.loss:.4f} "
-            f"elementwise_f1={test_metrics.elementwise_f1:.4f} "
-            f"exact_match_accuracy={test_metrics.exact_match_accuracy:.4f} "
-            f"any_sv_f1={test_metrics.any_sv_f1:.4f}"
+            f"epoch={epoch} "
+            f"train_loss={train_metrics.loss:.4f} "
+            f"val_loss={val_metrics.loss:.4f} "
+            f"val_elementwise_f1={val_metrics.elementwise_f1:.4f}"
         )
-        return results
-    finally:
-        if wandb_run is not None:
-            wandb_run.finish()
 
+        if val_metrics.elementwise_f1 > best_val_f1:
+            best_val_f1 = val_metrics.elementwise_f1
+            best_val_metrics = val_metrics
 
-def main() -> None:
-    arguments = parse_args()
-    train(arguments)
+        # fast-fail on NaN
+        if val_metrics.loss != val_metrics.loss or val_metrics.loss > 100:
+            print("FAIL")
+            sys.exit(1)
+
+    training_seconds = time.time() - training_start
+    total_seconds = time.time() - total_start
+
+    if best_val_metrics is None:
+        print("FAIL")
+        sys.exit(1)
+
+    print_summary(
+        val_metrics=best_val_metrics,
+        training_seconds=training_seconds,
+        total_seconds=total_seconds,
+        num_epochs=EPOCHS,
+        num_params=num_params,
+    )
 
 
 if __name__ == "__main__":
