@@ -1,10 +1,8 @@
 """Fixed data-loading and evaluation harness for the autoresearch loop.
 
-This file is READ-ONLY for the AI agent. It defines:
-- Constants (input shape, label length, data paths)
-- Dataset and DataLoader construction
-- Metrics accumulation and evaluation
-- The structured summary printer
+This file is READ-ONLY for the AI agent. Do not modify.
+It contains the fixed evaluation, data loading, dataset, metrics,
+and training constants (time budget, input shape, etc).
 
 The agent edits train.py only; prepare.py is the stable contract.
 """
@@ -21,7 +19,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
 EXPECTED_INPUT_SHAPE = (2000, 9)
@@ -30,8 +28,9 @@ INPUT_LENGTH = 2000
 NUM_FEATURES = 9
 NUM_SUBWINDOWS = 10
 SUBWINDOW_SIZE = 200
+TIME_BUDGET = 300  # training time budget in seconds (5 minutes)
 
-# Default data directories — override with CLI args if needed
+# Data directories
 DEFAULT_TRAIN_DIRECTORY = Path("data/features/training/matrices")
 DEFAULT_VALIDATION_DIRECTORY = Path("data/features/validation/matrices")
 DEFAULT_TEST_DIRECTORY = Path("data/features/test/matrices")

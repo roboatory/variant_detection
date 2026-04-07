@@ -19,17 +19,17 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment trains for a fixed number of epochs (default 20) on the available device (MPS/CUDA/CPU). You launch it simply as: `cd src/models && uv run python train.py`.
+Each experiment runs on a single device (MPS/CUDA/CPU). The training script runs for a **fixed time budget of 5 minutes** (wall clock training time). It loops over epochs until the time budget is exhausted or `MAX_EPOCHS` is reached. You launch it simply as: `cd src/models && uv run python train.py`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, activation functions, normalization, loss function, etc.
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, dataset, metrics, and constants (input shape, label length, etc).
+- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, dataset, metrics, and training constants (time budget, input shape, etc).
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the highest val_elementwise_f1.** This is the per-subwindow binary F1 score on the validation set. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and the model remains compatible with input shape `(batch, 2000, 9)` producing 10 binary logits (one per 200 bp subwindow).
+**The goal is simple: get the highest val_elementwise_f1.** This is the per-subwindow binary F1 score on the validation set. Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and the model remains compatible with input shape `(batch, 2000, 9)` producing 10 binary logits (one per 200 bp subwindow).
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 F1 improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 F1 improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -101,7 +101,7 @@ LOOP FOREVER:
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take a few minutes depending on hardware. If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for data loading and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 

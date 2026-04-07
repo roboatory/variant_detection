@@ -1,17 +1,9 @@
-"""Autoresearch-compatible training script for SV detection.
-
-This is the file the AI agent edits. It contains:
-- Model architecture (SVHunterModel and all sub-modules)
-- Optimizer configuration
-- Training loop
-- Hyperparameters as top-level constants
-
-Run: uv run python src/models/train.py > run.log 2>&1
-Grep: grep "^val_elementwise_f1:" run.log
+"""
+Autoresearch training script for SV detection. Single-file.
+Usage: cd src/models && uv run python train.py
 """
 
-from __future__ import annotations
-
+import math
 import sys
 import time
 
@@ -22,7 +14,7 @@ from torch.optim import Adam
 from prepare import (
     DEFAULT_TRAIN_DIRECTORY,
     DEFAULT_VALIDATION_DIRECTORY,
-    EpochMetrics,
+    TIME_BUDGET,
     MetricsAccumulator,
     create_dataloader,
     evaluate,
@@ -31,34 +23,13 @@ from prepare import (
     set_seed,
 )
 
-# ===== HYPERPARAMETERS (edit these) ==========================================
-
-SEED = 42
-EPOCHS = 20
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.0
-NUM_WORKERS = 0
-MAX_SAMPLES = None
-
-# model
-NUM_FEATURES = 9
-INPUT_LENGTH = 2000
-SUBWINDOW_SIZE = 200
-NUM_SUBWINDOWS = 10
-EMBEDDING_DIMENSION = 100
-NUM_HEADS = 4
-KEY_DIMENSION = 32
-NUM_TRANSFORMER_BLOCKS = 3
-MLP_HIDDEN_DIMENSION = 128
-ATTENTION_DROPOUT = 0.3
-HEAD_DROPOUT = 0.4
-
-# ===== MODEL ARCHITECTURE ====================================================
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 
 class SVHunterSubwindowEncoder(nn.Module):
-    def __init__(self, num_features: int = NUM_FEATURES) -> None:
+    def __init__(self, num_features: int = 9) -> None:
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(1, 128, kernel_size=(1, num_features), padding="valid"),
@@ -87,10 +58,10 @@ class SVHunterSubwindowEncoder(nn.Module):
 class SVHunterMultiHeadAttention(nn.Module):
     def __init__(
         self,
-        embedding_dimension: int = EMBEDDING_DIMENSION,
-        num_heads: int = NUM_HEADS,
-        key_dimension: int = KEY_DIMENSION,
-        dropout: float = ATTENTION_DROPOUT,
+        embedding_dimension: int,
+        num_heads: int,
+        key_dimension: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.embedding_dimension = embedding_dimension
@@ -143,10 +114,10 @@ class SVHunterMultiHeadAttention(nn.Module):
 class SVHunterTransformerBlock(nn.Module):
     def __init__(
         self,
-        embedding_dimension: int = EMBEDDING_DIMENSION,
-        num_heads: int = NUM_HEADS,
-        key_dimension: int = KEY_DIMENSION,
-        dropout: float = ATTENTION_DROPOUT,
+        embedding_dimension: int,
+        num_heads: int,
+        key_dimension: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.layer_normalization_1 = nn.LayerNorm(embedding_dimension)
@@ -232,115 +203,142 @@ class SVHunterModel(nn.Module):
         return self.classifier(x).squeeze(-1)
 
 
-# ===== TRAINING LOOP =========================================================
+# ---------------------------------------------------------------------------
+# Hyperparameters (edit these directly, no CLI flags needed)
+# ---------------------------------------------------------------------------
 
+# Model architecture
+NUM_FEATURES = 9
+INPUT_LENGTH = 2000
+SUBWINDOW_SIZE = 200
+NUM_SUBWINDOWS = 10
+EMBEDDING_DIMENSION = 100
+NUM_HEADS = 4
+KEY_DIMENSION = 32
+NUM_TRANSFORMER_BLOCKS = 3
+MLP_HIDDEN_DIMENSION = 128
+ATTENTION_DROPOUT = 0.3
+HEAD_DROPOUT = 0.4
 
-def train_one_epoch(
-    model: nn.Module,
-    dataloader: torch.utils.data.DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> EpochMetrics:
+# Optimization
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 0.0
+MAX_EPOCHS = 100  # upper bound on epochs (may stop earlier via time budget)
+
+# Misc
+SEED = 42
+NUM_WORKERS = 0
+MAX_SAMPLES = None  # cap samples per split (None = use all)
+
+# ---------------------------------------------------------------------------
+# Setup: seed, device, data, model, optimizer
+# ---------------------------------------------------------------------------
+
+t_start = time.time()
+set_seed(SEED)
+device = torch.device(get_default_device_name())
+print(f"Device: {device}")
+print(f"Time budget: {TIME_BUDGET}s")
+
+train_loader = create_dataloader(
+    split_directory=DEFAULT_TRAIN_DIRECTORY,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    max_samples=MAX_SAMPLES,
+)
+validation_loader = create_dataloader(
+    split_directory=DEFAULT_VALIDATION_DIRECTORY,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    max_samples=MAX_SAMPLES,
+)
+
+model = SVHunterModel().to(device)
+num_params = sum(p.numel() for p in model.parameters())
+print(f"Parameters: {num_params:,}")
+
+criterion = nn.BCEWithLogitsLoss()
+optimizer = Adam(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+)
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+t_start_training = time.time()
+best_val_f1 = float("-inf")
+best_val_metrics = None
+total_training_time = 0.0
+epochs_completed = 0
+
+for epoch in range(1, MAX_EPOCHS + 1):
+    t_epoch_start = time.time()
+
+    # Train
     model.train()
     accumulator = MetricsAccumulator()
-
-    for features, labels in dataloader:
+    for features, labels in train_loader:
         features = features.to(device=device, dtype=torch.float32, non_blocking=True)
         labels = labels.to(device=device, dtype=torch.float32, non_blocking=True)
-
         logits = model(features)
         loss = criterion(logits, labels)
-
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-
         accumulator.update(loss.item(), logits.detach(), labels.detach())
+    train_metrics = accumulator.compute()
 
-    return accumulator.compute()
-
-
-def main() -> None:
-    total_start = time.time()
-    set_seed(SEED)
-
-    device = torch.device(get_default_device_name())
-
-    train_loader = create_dataloader(
-        split_directory=DEFAULT_TRAIN_DIRECTORY,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        max_samples=MAX_SAMPLES,
-    )
-    validation_loader = create_dataloader(
-        split_directory=DEFAULT_VALIDATION_DIRECTORY,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        max_samples=MAX_SAMPLES,
+    # Validate
+    val_metrics = evaluate(
+        model=model,
+        dataloader=validation_loader,
+        criterion=criterion,
+        device=device,
     )
 
-    model = SVHunterModel().to(device)
-    num_params = sum(p.numel() for p in model.parameters())
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
+    t_epoch_end = time.time()
+    total_training_time += t_epoch_end - t_epoch_start
+    epochs_completed = epoch
+    remaining = max(0, TIME_BUDGET - total_training_time)
+
+    print(
+        f"epoch {epoch:03d} | "
+        f"train_loss={train_metrics.loss:.4f} | "
+        f"val_loss={val_metrics.loss:.4f} | "
+        f"val_f1={val_metrics.elementwise_f1:.4f} | "
+        f"remaining={remaining:.0f}s"
     )
 
-    best_val_f1 = float("-inf")
-    best_val_metrics = None
-    training_start = time.time()
+    if val_metrics.elementwise_f1 > best_val_f1:
+        best_val_f1 = val_metrics.elementwise_f1
+        best_val_metrics = val_metrics
 
-    for epoch in range(1, EPOCHS + 1):
-        train_metrics = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-        )
-        val_metrics = evaluate(
-            model=model,
-            dataloader=validation_loader,
-            criterion=criterion,
-            device=device,
-        )
-
-        print(
-            f"epoch={epoch} "
-            f"train_loss={train_metrics.loss:.4f} "
-            f"val_loss={val_metrics.loss:.4f} "
-            f"val_elementwise_f1={val_metrics.elementwise_f1:.4f}"
-        )
-
-        if val_metrics.elementwise_f1 > best_val_f1:
-            best_val_f1 = val_metrics.elementwise_f1
-            best_val_metrics = val_metrics
-
-        # fast-fail on NaN
-        if val_metrics.loss != val_metrics.loss or val_metrics.loss > 100:
-            print("FAIL")
-            sys.exit(1)
-
-    training_seconds = time.time() - training_start
-    total_seconds = time.time() - total_start
-
-    if best_val_metrics is None:
+    # Fast fail: abort if loss is exploding or NaN
+    if math.isnan(val_metrics.loss) or val_metrics.loss > 100:
         print("FAIL")
         sys.exit(1)
 
-    print_summary(
-        val_metrics=best_val_metrics,
-        training_seconds=training_seconds,
-        total_seconds=total_seconds,
-        num_epochs=EPOCHS,
-        num_params=num_params,
-    )
+    # Time's up
+    if total_training_time >= TIME_BUDGET:
+        break
 
+# Final summary
+t_end = time.time()
 
-if __name__ == "__main__":
-    main()
+if best_val_metrics is None:
+    print("FAIL")
+    sys.exit(1)
+
+print_summary(
+    val_metrics=best_val_metrics,
+    training_seconds=total_training_time,
+    total_seconds=t_end - t_start,
+    num_epochs=epochs_completed,
+    num_params=num_params,
+)
