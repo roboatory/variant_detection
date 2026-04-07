@@ -151,6 +151,8 @@ class SVHunterModel(nn.Module):
             raise ValueError("INPUT_LENGTH must equal SUBWINDOW_SIZE * NUM_SUBWINDOWS")
 
         self.input_norm = nn.LayerNorm(NUM_FEATURES)
+        self.input_pos_embedding = nn.Parameter(torch.zeros(1, INPUT_LENGTH, 1))
+        nn.init.normal_(self.input_pos_embedding, std=0.02)
         self.encoder = SVHunterSubwindowEncoder(num_features=NUM_FEATURES + 1)
         self.patch_projection = nn.Linear(
             self.encoder.output_dimension, EMBEDDING_DIMENSION
@@ -190,10 +192,8 @@ class SVHunterModel(nn.Module):
 
         batch_size = x.shape[0]
         x = self.input_norm(x)
-        # Add positional channel (normalized position within window)
-        pos = torch.linspace(0, 1, INPUT_LENGTH, device=x.device, dtype=x.dtype)
-        pos = pos.unsqueeze(0).unsqueeze(-1).expand(batch_size, -1, 1)
-        x = torch.cat([x, pos], dim=-1)
+        # Add learnable positional channel
+        x = torch.cat([x, self.input_pos_embedding.expand(batch_size, -1, -1)], dim=-1)
         x = x.view(batch_size, NUM_SUBWINDOWS, SUBWINDOW_SIZE, NUM_FEATURES + 1)
         x = x.unsqueeze(2).reshape(
             batch_size * NUM_SUBWINDOWS, 1, SUBWINDOW_SIZE, NUM_FEATURES + 1
