@@ -222,8 +222,8 @@ HEAD_DROPOUT = 0.4
 
 # Optimization
 BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.0
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-4
 MAX_EPOCHS = 100  # upper bound on epochs (may stop earlier via time budget)
 
 # Misc
