@@ -38,9 +38,11 @@ def gather_SFS_signatures(bed, fragments, offsets, signatures, extension=50):
     variant_start_position = int(variant[1])
     variant_end_position = int(variant[2])
 
-    with open(bed, "r") as bed_file, open(signatures, "r") as signatures_file, open(
-        destination, "w"
-    ) as fragments_file:
+    with (
+        open(bed, "r") as bed_file,
+        open(signatures, "r") as signatures_file,
+        open(destination, "w") as fragments_file,
+    ):
         _ = bed_file.readline()  # ignore BED header information
 
         fragments_file.write(
@@ -165,47 +167,16 @@ def launch_chromosome_analysis(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="sample-specific string (SFS) analysis"
-    )
+    # fmt: off
+    parser = argparse.ArgumentParser(description="sample-specific string (SFS) analysis")
 
-    parser.add_argument(
-        "-c",
-        "--chromosomes",
-        default="chr21",
-        help="limits SFS analysis to particular chromosomes; \
-                                                                          specify as a comma separated list or using the keyword 'all' for the entire genome (default: chr21)",
-    )
-    parser.add_argument(
-        "-d",
-        "--bed",
-        default="data/bed",
-        help="path to variant BED directory (default: data/bed)",
-    )
-    parser.add_argument(
-        "-f",
-        "--fragments",
-        default="data/fragments",
-        help="output location for SFS binned by chromosomal variant (default: data/fragments)",
-    )
-    parser.add_argument(
-        "-g",
-        "--generate_index",
-        action="store_true",
-        help="generate a .index file for fast lookup",
-    )
-    parser.add_argument(
-        "-i",
-        "--images",
-        default="data/fragment-images",
-        help="output image directory (default: data/fragment-images)",
-    )
-    parser.add_argument(
-        "-s",
-        "--signatures",
-        default="data/SFS_signatures.txt",
-        help="path to .txt file containing the extracted SFS (default: data/SFS_signatures.txt)",
-    )
+    parser.add_argument("-c", "--chromosomes", default="chr21", help="limits SFS analysis to particular chromosomes; specify as a comma separated list or using the keyword 'all' for the entire genome (default: chr21)")
+    parser.add_argument("-d", "--bed", default="data/bed", help="path to variant BED directory (default: data/bed)")
+    parser.add_argument("-f", "--fragments", default="data/fragments", help="output location for SFS binned by chromosomal variant (default: data/fragments)")
+    parser.add_argument("-g", "--generate_index", action="store_true", help="generate a .index file for fast lookup")
+    parser.add_argument("-i", "--images", default="data/fragment-images", help="output image directory (default: data/fragment-images)")
+    parser.add_argument("-s", "--signatures", default="data/SFS_signatures.txt", help="path to .txt file containing the extracted SFS (default: data/SFS_signatures.txt)")
+    # fmt: on
 
     return parser.parse_args()
 

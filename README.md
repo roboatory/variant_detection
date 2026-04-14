@@ -1,62 +1,79 @@
-## Current `extract_cutesv_indels.py` Feature Extraction (Implementation Summary)
+# DIP-SV-FILTER
 
-The script builds per-variant evidence from a BAM and VCF in two passes.  
-First, it precomputes **split-read (inter-alignment) signatures** per chromosome by finding reads with multiple alignments and applying distance/overlap heuristics to adjacent segments.  
-Then, for each VCF variant, it scans CIGAR operations in overlapping reads to collect **intra-alignment signatures** (`D` for deletions, `I` for insertions).  
+A post-calling structural variant (SV) filtering tool for long-read sequencing data. DIP-SV-FILTER reduces false positives in SV callsets by jointly modeling clustered SV candidates as alternative diploid sequence hypotheses, using a time-distributed CNN-Transformer classifier to score residual alignment signal after local realignment.
 
-For each variant, it writes a BED-like file with rows:
-`CHROMOSOME, START, END, READ, TYPE` where `TYPE` is one of:
-- `INTRA_DEL` / `INTRA_INS`
-- `INTER_DEL` / `INTER_INS`
+## Setup
 
-It also generates:
-- a signature plot (variant interval plus read-support intervals), and
-- an encoded matrix image where per-base support is represented as:
-  - `0` = no support
-  - `1` = intra-alignment support
-  - `2` = inter-alignment support
+Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
-### Concrete CIGAR Example (What Gets Recorded)
-
-Assume:
-- variant from VCF: `chr21:1005-1025` (so `start=1005`, `length=20`)
-- extension used by the script: `50` bp
-- one read: `readA`
-- read alignment start: `990`
-- simulated CIGAR: `10M6D20M4I10M`
-
-The script tracks a reference cursor `current_read_position`, starting at `990`.
-
-#### If `--type DEL`
-
-Processing:
-- `10M`: cursor `990 -> 1000`
-- `6D`: deletion spans `1000-1006`; this overlaps the variant window (`955-1075`), so it writes:
-
-```text
-chr21    1000    1006    readA    INTRA_DEL
+```bash
+uv sync            # install dependencies from lockfile
+uv run pre-commit install   # set up linting hooks
 ```
 
-- `20M`: cursor `1006 -> 1026`
-- `4I`: ignored in DEL mode
-- `10M`: cursor `1026 -> 1036`
+## Usage
 
-Result for this read in DEL mode: one `INTRA_DEL` record.
+### Feature extraction
 
-#### If `--type INS`
+Extract MAMNET-style alignment features from a BAM file into per-window `.npy` matrices (shape `2000 x 9`):
 
-Processing:
-- `10M`: cursor `990 -> 1000`
-- `6D`: cursor `1000 -> 1006` (no INS record)
-- `20M`: cursor `1006 -> 1026`
-- `4I`: insertion tested at `1026-1030`; overlaps variant window, so it writes:
-
-```text
-chr21    1026    1030    readA    INTRA_INS
+```bash
+uv run python src/featurizers/extract_mamnet_features.py \
+  --bam data/HG002_chr21.bam \
+  --contig chr21 \
+  --start 1000000 \
+  --end 1002000
 ```
 
-- `10M`: cursor continues from updated value
+### Training
 
-Result for this read in INS mode: one `INTRA_INS` record.
+Train the CNN-Transformer classifier on pre-extracted feature matrices:
 
-In both modes, any overlapping split-read signature found in the precomputed inter-alignment pass is appended as `INTER_DEL` or `INTER_INS` rows in the same per-variant BED file.
+```bash
+uv run python src/models/train.py \
+  --train_directory data/features/training/matrices \
+  --validation_directory data/features/validation/matrices \
+  --test_directory data/features/test/matrices \
+  --output_directory output
+```
+
+Training logs to [Weights & Biases](https://wandb.ai) by default (`--wandb_mode disabled` to turn off).
+
+### Inference
+
+Run a trained model on new feature matrices:
+
+```bash
+uv run python src/models/inference.py \
+  --checkpoint_file_path output/best_model.pt \
+  --split_directory data/features/test/matrices \
+  --output_file_path output/predictions.tsv
+```
+
+## Project structure
+
+```
+src/
+  featurizers/
+    extract_mamnet_features.py      # BAM -> (2000, 9) .npy feature matrices
+    extract_cutesv_indels.py        # intra/inter-alignment SV signature extraction
+    parse_sample_specific_strings.py # sample-specific string analysis
+  models/
+    architecture.py                 # CNN-Transformer model definition
+    train.py                        # training loop, metrics, checkpointing
+    inference.py                    # batch inference from checkpoint
+tests/
+data/
+  features/{training,validation,test}/
+    labels.txt                      # per-split label file
+    matrices/                       # .npy feature matrices
+```
+
+## Linting
+
+```bash
+uv run ruff check .
+uv run ruff format .
+```
+
+Pre-commit hooks run ruff lint, ruff format, and nbstripout automatically.

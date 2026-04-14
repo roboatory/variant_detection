@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A structural variant (SV) detection pipeline inspired by SVHUNTER. It extracts alignment-derived features from BAM/VCF files using MAMNET, encodes them as 2D numeric matrices, and classifies genomic windows using CNNs & transformers.
+DIP-SV-FILTER is a post-calling SV filtering framework for long-read sequencing data. It groups nearby candidate SVs into local clusters, constructs alternative diploid sequence hypotheses, and uses a time-distributed CNN-Transformer classifier to score residual alignment signal — retaining SVs whose presence best explains the observed reads.
+
+The repository covers feature extraction from BAM/VCF files, model training, and inference.
 
 ## Commands
 
@@ -12,10 +14,11 @@ A structural variant (SV) detection pipeline inspired by SVHUNTER. It extracts a
 uv sync                  # install all dependencies from lockfile
 uv run <script>          # run any script in the project environment
 
-# featurization (example; start/end are 0-based; end is exclusive)
-uv run python src/featurizers/extract_mamnet_features.py --bam data/HG002_chr21.bam --contig chr21 --start 1000000 --end 1002000
+# featurization (start/end are 0-based; end is exclusive)
+uv run python src/featurizers/extract_mamnet_features.py \
+  --bam data/HG002_chr21.bam --contig chr21 --start 1000000 --end 1002000
 
-# training (labels.txt is resolved per split: <split>/labels.txt)
+# training
 uv run python src/models/train.py \
   --train_directory data/features/training/matrices \
   --validation_directory data/features/validation/matrices \
@@ -33,14 +36,14 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-Pre-commit hooks run ruff lint + format on Python and Jupyter files.
+Pre-commit hooks run ruff lint, ruff format, and nbstripout on Python and Jupyter files.
 
 ## Architecture
 
 ### Pipeline stages
 
 1. **Feature extraction** (`src/featurizers/`) — reads BAM+VCF, produces per-window `.npy` matrices
-2. **Model training** (`src/models/train.py`) — trains the SVHUNTER model, logs to W&B
+2. **Model training** (`src/models/train.py`) — trains the classifier, logs to W&B
 3. **Inference** (`src/models/inference.py`) — loads a checkpoint, outputs a TSV of predictions
 
 ### Feature matrix contract
@@ -55,7 +58,11 @@ Each example is a `.npy` file of shape `(2000, 9)` representing a 2 KB genomic w
 
 ### Model (`src/models/architecture.py`)
 
-SVHUNTER: splits a `(batch, 2000, 9)` input into 10 subwindows of 200 bp, encodes each with a shared CNN, projects to an embedding space with positional embeddings, runs through transformer blocks, and produces 10 binary logits (one per subwindow). Trained with `BCEWithLogitsLoss`.
+Time-distributed CNN-Transformer classifier. Takes a `(batch, 2000, 9)` input, applies input LayerNorm and concatenates a learnable 1D positional embedding (expanding to 10 channels), splits into 10 subwindows of 200 bp, encodes each with a shared CNN, projects to a 128-dim embedding space with positional embeddings, runs through 4 transformer blocks (4 heads, key dim 32, attention dropout 0.1), and produces 10 binary logits via a 384-unit MLP head (head dropout 0.2). Trained with `BCEWithLogitsLoss`.
+
+### Training defaults
+
+AdamW optimizer (LR 2e-4, weight decay 1e-3) with cosine annealing schedule. Batch size 64. Best checkpoint selected by validation elementwise F1.
 
 ### Label format
 

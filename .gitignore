@@ -1,19 +1,17 @@
-# Python-generated files
 __pycache__/
-*.py[oc]
-build/
+*.py[cod]
+*.so
+.Python
+.venv/
 dist/
-wheels/
-*.egg-info
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+.DS_Store
 
-# Virtual environments
-.venv
-
-# Apple files
-*.DS_Store
-
-# Project files
 data/
-output/
-plans/
+*output*/
 wandb/
