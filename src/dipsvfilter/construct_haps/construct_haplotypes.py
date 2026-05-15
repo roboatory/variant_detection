@@ -6,37 +6,20 @@
 # This is originally the flank_SV.py
 #
 # changes:
-# - Removed unused commented-out legacy code blocks from v2.
 # - Split FASTA header construction and haplotype sequence construction into
 #   helper methods.
-# - Added constructed-haplotype SV coordinates to each FASTA header as
-#   hapSV=sv_index:start-end. Coordinates are 0-based, half-open positions on
-#   the constructed sequence; all-reference haplotypes use hapSV=NA.
+# - FASTA filenames record the shared cluster location as chrom_start-end.fasta.
+# - FASTA headers use pipe-delimited fields for haplotype-specific information:
+#   SVs=id1;id2|GT=gt1:gt2|hapSV=sv_id:start-end;sv_id:start-end.
+#   hapSV coordinates are 0-based, half-open positions on the constructed
+#   sequence; all-reference haplotypes use hapSV=NA.
+
+# TODO: add methods to handle sequence collisions (different SV genotypes, but representing/generating the same sequence)
 
 import itertools
 import os
-import re
 
-from dipsvfilter.utils import get_ref, read_fai
-
-
-def SimpleVCFParser(handle):
-    for line in handle:
-        if line[0] == "#":
-            continue
-
-        sv = dict()
-        line = line.rstrip("\n").split("\t")
-        sv["chrom"], start, _, ref, alt, _, _, _, format_field = line[:9]
-        gt_index = format_field.split(":").index("GT")
-        gt = re.split(r"([/|])", line[9].split(":")[gt_index])
-
-        sv["gt"] = gt
-        sv["start"] = int(start) - 1
-        sv["end"] = sv["start"] + len(ref)
-        sv["seqs"] = [ref] + alt.split(",")
-
-        yield sv
+from utils import SimpleVCFParser, get_ref, read_fai
 
 
 class SVCluster:
@@ -48,11 +31,13 @@ class SVCluster:
             raise ValueError("Missing reference file and/or fai dictionary for SVCluster class")
 
         self.chrom = sv["chrom"]
+        self.ids = [sv["id"]]
         self.bps = [(sv["start"], sv["end"])]
         self.seqs = [sv["seqs"]]
         self.gts = [["0" if i == "." else i for i in sv["gt"]]]
 
     def add_sv(self, sv):
+        self.ids.append(sv["id"])
         self.bps.append((sv["start"], sv["end"]))
         self.seqs.append(sv["seqs"])
         self.gts.append(["0" if i == "." else i for i in sv["gt"]])
@@ -84,21 +69,24 @@ class SVCluster:
             combos.append(gt_comb)
         return combos
 
-    def make_header(self, cluster_start, cluster_end, hap_gt, sv_intervals):
-        sv_starts = ":".join(str(start) for start, _ in self.bps)
+    def cluster_bounds(self, flank):
+        cluster_start = max(0, self.bps[0][0] - flank)
+        cluster_end = sorted(self.bps, key=lambda x: x[1])[-1][-1] + flank
+        chrom_len = SVCluster.fai_dict[self.chrom][0]
+        return cluster_start, min(cluster_end, chrom_len)
+
+    def make_header(self, hap_gt, sv_intervals):
+        sv_ids = ";".join(self.ids)
         gt_name = ":".join(str(gt) for gt in hap_gt)
         if sv_intervals:
-            interval_name = ",".join(
-                f"sv{sv_index}:{seq_start}-{seq_end}"
+            interval_name = ";".join(
+                f"{self.ids[sv_index]}:{seq_start}-{seq_end}"
                 for sv_index, seq_start, seq_end in sv_intervals
             )
         else:
             interval_name = "NA"
 
-        return (
-            f">{self.chrom}_{cluster_start}-{cluster_end}_{sv_starts}_{gt_name}"
-            f"_hapSV={interval_name}\n"
-        )
+        return f">SVs={sv_ids}|GT={gt_name}|hapSV={interval_name}\n"
 
     def build_haplotype_sequence(self, cluster_start, cluster_end, hap_gt):
         hap_bps = [self.bps[i] for i in range(len(hap_gt)) if hap_gt[i] != 0]
@@ -136,8 +124,7 @@ class SVCluster:
         return "".join(parts), sv_intervals
 
     def write(self, out_dir, flank):
-        cluster_start = self.bps[0][0] - flank
-        cluster_end = sorted(self.bps, key=lambda x: x[1])[-1][-1] + flank
+        cluster_start, cluster_end = self.cluster_bounds(flank)
 
         combos = self.get_gt_combos()
         n = 1
@@ -151,7 +138,7 @@ class SVCluster:
             return
 
         valid_combs = []
-        out_fa = os.path.join(out_dir, f"{self.chrom}_{cluster_start}-{cluster_end}.fasta")
+        
         for combo in itertools.product(*combos):
             if not combo:
                 continue
@@ -163,10 +150,11 @@ class SVCluster:
             valid_combs += hap_gts
 
         written = False
+        out_fa = os.path.join(out_dir, f"{self.chrom}_{cluster_start}-{cluster_end}.fasta")
         with open(out_fa, "w") as f:
-            for hap_gt in set(valid_combs):
+            for hap_gt in sorted(set(valid_combs)):
                 seq, sv_intervals = self.build_haplotype_sequence(cluster_start, cluster_end, hap_gt)
-                f.write(self.make_header(cluster_start, cluster_end, hap_gt, sv_intervals))
+                f.write(self.make_header(hap_gt, sv_intervals))
                 f.write(seq + "\n")
                 written = True
 
@@ -187,38 +175,41 @@ def construct_haplotypes(vcf, ref, flank, out_dir):
     SVCluster.ref = ref_f
     SVCluster.fai_dict = fai_dict
 
-    with open(vcf, "r") as vf:
-        vcfparser = SimpleVCFParser(vf)
+    vcfparser = SimpleVCFParser(vcf)
 
-        for sv in vcfparser:
-            if sv["gt"][0] == "0" and sv["gt"][-1] == "0":
-                continue
+    for sv in vcfparser:
+        if sv["gt"] is None:
+            continue
+        if sv["gt"][0] == "0" and sv["gt"][-1] == "0":
+            continue
+        chrom = sv["chrom"]
+        last_end = sv["end"]
+        svc = SVCluster(sv)
+        break
+    else:
+        raise ValueError("No valid SVCluster found in input VCF")
+
+    for sv in vcfparser:
+        if sv["gt"] is None:
+            continue
+        if sv["gt"][0] == "0" and sv["gt"][-1] == "0":
+            continue
+
+        if sv["chrom"] != chrom:
+            svc.write(out_dir, flank)
             chrom = sv["chrom"]
             last_end = sv["end"]
             svc = SVCluster(sv)
-            break
+        elif sv["start"] - last_end < flank:
+            svc.add_sv(sv)
+            if sv["end"] > last_end:
+                last_end = sv["end"]
         else:
-            raise ValueError("No valid SVCluster found in input VCF")
+            svc.write(out_dir, flank)
+            last_end = sv["end"]
+            svc = SVCluster(sv)
 
-        for sv in vcfparser:
-            if sv["gt"][0] == "0" and sv["gt"][-1] == "0":
-                continue
-
-            if sv["chrom"] != chrom:
-                svc.write(out_dir, flank)
-                chrom = sv["chrom"]
-                last_end = sv["end"]
-                svc = SVCluster(sv)
-            elif sv["start"] - last_end < flank:
-                svc.add_sv(sv)
-                if sv["end"] > last_end:
-                    last_end = sv["end"]
-            else:
-                svc.write(out_dir, flank)
-                last_end = sv["end"]
-                svc = SVCluster(sv)
-
-        svc.write(out_dir, flank)
+    svc.write(out_dir, flank)
 
     ref_f.close()
 
@@ -229,7 +220,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--vcf", "-i", help="SORTED VCF")
     parser.add_argument("--out", "-o", help="Output directory")
-    parser.add_argument("--flank", "-f", default=100, type=int, help="length of flanking reference sequence")
+    parser.add_argument("--flank", "-f", default=5000, type=int, help="length of flanking reference sequence")
     parser.add_argument("--ref", "-r", help="reference file")
 
     args = parser.parse_args()
